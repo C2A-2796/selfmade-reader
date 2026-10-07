@@ -9,3 +9,4 @@ __pycache__/
 # vendor software is not redistributed here
 ReaderSoft*/
 *.rar
+.~lock.*
