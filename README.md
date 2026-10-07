@@ -5,8 +5,9 @@ One Python file, **no dependencies** (Python 3.8+ standard library only).
 
 - Configure the reader from a web page (output interface, remote server, network, WiFi, RF power) with automatic backup/restore.
 - Live tag dashboard.
-- Stores every read to CSV.
+- Stores reads to CSV (de-duplicated, optional daily files).
 - Forwards reads to an HTTP webhook, an MQTT broker or a TCP server over whatever network the computer has (Ethernet, WiFi, 4G/5G hotspot).
+- Queues forwarded data on disk when the link is down and resends it; `/api/health` endpoint for monitoring; optional password and reader-IP allow-list.
 - Optional start-at-boot (Linux systemd, macOS launchd, Windows Task Scheduler).
 
 > **New to this?** Follow **[docs/SOP.md](docs/SOP.md)** step by step.
@@ -42,7 +43,7 @@ Developed and tested on **Linux** with a real reader (tag reception, CSV, settin
 
 - Never set the reader's *Work mode* to **Answer**: it stops pushing tags and silences the buzzer.
 - A backup of the reader settings is saved to `backup/` before every write. Keep it.
-- The web UI listens on `127.0.0.1` only unless started with `--host 0.0.0.0`; anyone who can open the page can change the reader's settings, so only expose it on a trusted network.
+- The web UI listens on `127.0.0.1` only unless started with `--host 0.0.0.0`; anyone who can open the page can change the reader's settings, so use `--password` and only expose it on a trusted network. You can also restrict which reader IPs may push tags.
 - Don't commit `selfmade_reader_config.json` (may hold MQTT/HTTP credentials) or the CSV data; `.gitignore` already excludes them.
 
 ## Not included

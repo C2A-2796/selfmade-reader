@@ -85,8 +85,9 @@ If any of these fails go to §9.
 
 *Data & forwarding* tab → **Storage**:
 - *CSV file path*: where rows are written.
-- *Save*: **every read** (a tag near the antenna is read ~9 times/s ≈ 50 MB/day) or **one row per tag per 1 s / 5 s / 60 s** (recommended for long runs).
-Click **Save data settings**. ✅
+- *Save*: **every read** (a tag near the antenna is read ~9 times/s ≈ 50 MB/day) or **one row per tag per 1 s / 5 s / 60 s**. **Default is one row per tag per 1 s.**
+- *New file every day*: writes `name_YYYY-MM-DD.csv` instead of one ever-growing file (recommended for long deployments).
+Click **Save data settings**. ✅ (Daily files, de-duplication ✅ tested.)
 
 ## 6. Procedure — forward data over the internet 🧪
 
@@ -99,7 +100,8 @@ The computer's own connection is used (Ethernet, WiFi or a 4G/5G phone hotspot).
 2. Set *Enabled = yes*, click **Test** (must say "test OK"), then **Save data settings**.
 3. The Dashboard counter *forwarded OK / failed* shows delivery. Failures are logged in the **Log** tab.
 
-Limits: no TLS for MQTT, no disk buffering if the link is down (queue is in memory, 20 000 items).
+**If the link is down**, items that cannot be delivered are saved to `forward_spool.jsonl` (cap 100 MB) and **resent automatically, oldest first, every 30 s** once the destination works again (the Dashboard shows *waiting: N*). ✅ tested. The CSV always has every read regardless.
+Limits: no TLS for MQTT; HTTP/MQTT/TCP are plain, so use a VPN or an HTTPS endpoint for sensitive data.
 
 ## 7. Procedure — start automatically at boot/login
 
@@ -128,12 +130,28 @@ Factory-like state: Interface `RS232/RS485`, remote server `120.78.148.145` port
 ### 8.4 4G / 5G ⚠️ (not yet tested)
 The reader's own 4G module (Interface `7 - 4G`) needs a SIM and an APN, and the APN field is not editable in this tool. To use mobile data, **forward from the computer** instead (§6) with a phone hotspot or modem as the computer's internet link.
 
-## 9. Troubleshooting
+## 9. Deployment hardening (read before putting it in service)
+
+| Topic | What to do |
+|---|---|
+| Who can reach the page | Default is this computer only (127.0.0.1). If you must open it from other PCs: `python3 selfmade_reader.py --host 0.0.0.0 --password <strong password>` ✅. Put the password in the service environment (`SELFMADE_PASSWORD`), not on the command line, for auto-start. The page is plain HTTP — only on a trusted LAN/VPN |
+| Who may send tags | *Reader setup* → **Only accept readers from these IPs** (e.g. `192.168.1.250`) ✅. Empty = any device that can reach port 6000 can inject tags |
+| Monitoring | `GET http://127.0.0.1:8088/api/health` → HTTP **200** when a reader is pushing, **503** otherwise, with `reader_pushing`, `reader_reachable`, `last_tag_age_s`, `spool`, `uptime_s` (add the password if set) ✅. Point your monitoring/cron at it |
+| Status bar meaning | green *reader connected* = OK · amber *reader reachable but not sending* = run One-click Ethernet setup · red *reader not reachable* = **check cable, reader power, IP** (the app pings the reader's command port every 15 s) |
+| Disk | use *New file every day* and a 1–60 s save interval; archive/delete old CSVs; `forward_spool.jsonl` is capped at 100 MB |
+| Survives reboot | Linux ✅ (started automatically on 3 consecutive reboots). Windows/macOS ⚠️ test with a reboot before relying on it |
+| Fixed addressing | give the computer a **static** IP on the reader's subnet (§4.3). If the cable is unplugged the app keeps running and resumes when the link returns |
+| Backups | keep `backup/` and copy `selfmade_reader_config.json` somewhere safe (it may contain credentials, never commit it) |
+| Updates | `git pull`, then restart: Linux `systemctl --user restart selfmade-reader`; or re-run `--install-autostart` |
+| Time | CSV timestamps use the computer's local clock — keep NTP/time sync on |
+
+## 10. Troubleshooting
 
 | Symptom | Check / fix |
 |---|---|
 | `ping 192.168.1.250` fails | cable, reader power, computer IP in `192.168.1.x`, no gateway typo; try *Find readers* |
-| Top bar "no reader connected" | run §4.5 again; firewall allows TCP 6000; no other program on port 6000 (log says *"Cannot listen on port 6000"*) |
+| Red bar "reader not reachable" | physical: cable (the PC's Ethernet port must show link), reader power/LED, reader IP and the computer's IP in the same subnet. (Seen in practice: after a move the port was DOWN and no data came — not an app fault) |
+| Amber bar "reachable but not sending" / no "reader connected" | run §4.5 again; firewall allows TCP 6000; no other program on port 6000 (log says *"Cannot listen on port 6000"*) |
 | Reader beeps but no rows | *Reader setup* → **Read from reader**: Interface must be `2 - RJ45`, Work mode `1 - Active`, remote server = this computer's IP and port 6000. Fix with §4.5 |
 | Buzzer silent, no data | Work mode was set to Answer — set `1 - Active`, write, restart reader |
 | *Find readers* finds nothing | UDP 65001 blocked by firewall, or wrong subnet; enter the IP manually |
@@ -146,7 +164,7 @@ The reader's own 4G module (Interface `7 - 4G`) needs a SIM and an APN, and the 
 
 Useful logs: the **Log** tab; Linux service: `journalctl --user -u selfmade-reader -f`; macOS: `selfmade_reader.log`.
 
-## 10. Acceptance checklist (sign-off)
+## 11. Acceptance checklist (sign-off)
 
 - [ ] `ping 192.168.1.250` replies
 - [ ] Program started; page opens on http://127.0.0.1:8088
@@ -157,10 +175,12 @@ Useful logs: the **Log** tab; Linux service: `journalctl --user -u selfmade-read
 - [ ] (if used) forwarding **Test** passes and *forwarded OK* increases
 - [ ] (if used) auto-start installed; after a reboot the page is available and tags still arrive
 - [ ] Backup file exists in `backup/`
+- [ ] `/api/health` returns 200 while the reader is connected
+- [ ] If the page is exposed beyond this computer: password set and reader IP allow-list set
 
 Commissioned by: ____________  Date: ____________  Computer/OS: ____________  Reader serial/MAC: ____________
 
-## 11. Test record (fill in after your run)
+## 12. Test record (fill in after your run)
 
 | Item | OS | Result | Notes |
 |---|---|---|---|
@@ -169,16 +189,20 @@ Commissioned by: ____________  Date: ____________  Computer/OS: ____________  Re
 | Windows/macOS auto-start | | | |
 | WiFi interface | | | |
 | HTTP/MQTT to real server | | | |
+| Spool: unplug network, read tags, plug back → items resent | | | |
+| Reboot → service/page back, tags arrive | | | |
 | Restore backup | | | |
 
-## 12. Reference
+## 13. Reference
 
 | Item | Value |
 |---|---|
 | Reader command port | TCP **60000** (reader side) |
 | Tag push port | TCP **6000** (computer side, configurable) |
 | Discovery | reader broadcasts UDP 65000 → 65001 every ~6 s |
-| Web UI | `http://127.0.0.1:8088` (`--host`, `--port` to change) |
+| Web UI | `http://127.0.0.1:8088` (`--host`, `--port`, `--password` to change) |
+| Health check | `/api/health` (200 = reader pushing, 503 = not) |
+| Forward spool | `forward_spool.jsonl` (auto-resent) |
 | Output data | `selfmade_reads.csv` in the program folder |
 | Settings file | `selfmade_reader_config.json` (do not commit; may hold credentials) |
 | Reader interface codes | 0 USB · 1 RS232/RS485 · **2 RJ45** · 3 WIFI · 4 Weigand · 5 Keyboard · 6 KeyboardNoEnter · 7 4G · 8 BlueTooth (1, 2, 7 verified) |

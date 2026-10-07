@@ -31,7 +31,9 @@ DEFAULT_CONFIG = {
     "listen_port": 6000,           # port this PC listens on for pushed tags
     "csv_path": os.path.join(HERE, "selfmade_reads.csv"),
     "csv_enabled": True,
-    "dedup_seconds": 0,            # 0 = store every read, N = one row per EPC per N seconds
+    "dedup_seconds": 1,            # 0 = store every read, N = one row per EPC per N seconds
+    "csv_daily": False,            # True = new file per day (name_YYYY-MM-DD.csv)
+    "allowed_reader_ips": [],      # empty = accept any reader; else only these IPs may push tags
     "http":  {"enabled": False, "url": "", "auth_header": ""},
     "tcp":   {"enabled": False, "host": "", "port": 9000},
     "mqtt":  {"enabled": False, "host": "", "port": 1883, "topic": "rfid/tags",
@@ -53,6 +55,11 @@ reader_links = {}          # ip -> last seen
 last_csv = {}              # epc -> last time written (dedup)
 fwd_q = queue.Queue(maxsize=20000)
 csv_lock = threading.Lock()
+reader_status = {"reachable": None, "checked": 0, "error": ""}
+last_tag_time = [0.0]
+PASSWORD = [""]
+SPOOL_PATH = os.path.join(HERE, "forward_spool.jsonl")
+deliver_lock = threading.Lock()
 
 
 # ------------------------------------------------------------------ config
@@ -274,6 +281,7 @@ def handle_tag(epc, rssi, ant, src):
         t = tags.setdefault(epc, {"count": 0, "first": now})
         t.update(count=t["count"] + 1, rssi=rssi, last=now, ant=ant, src=src)
         stats["reads"] += 1
+        last_tag_time[0] = now
         ev = {"type": "tag", "t": now, "epc": epc, "rssi": rssi, "ant": ant, "src": src,
               "count": t["count"]}
         recent.append(ev)
@@ -298,6 +306,9 @@ def handle_tag(epc, rssi, ant, src):
 
 def csv_append(ts, epc, rssi, ant, src):
     path = cfg["csv_path"]
+    if cfg.get("csv_daily"):
+        root, ext = os.path.splitext(path)
+        path = f"{root}_{datetime.fromtimestamp(ts).strftime('%Y-%m-%d')}{ext or '.csv'}"
     with csv_lock:
         try:
             new = not os.path.exists(path) or os.path.getsize(path) == 0
@@ -365,6 +376,11 @@ def listener_loop():
         except OSError:
             current = None
             continue
+        allowed = [x.strip() for x in cfg.get("allowed_reader_ips") or [] if x.strip()]
+        if allowed and addr[0] not in allowed:
+            log(f"Rejected connection from {addr[0]} (not in allowed reader IPs)", "error")
+            conn.close()
+            continue
         threading.Thread(target=serve_reader, args=(conn, addr), daemon=True).start()
 
 
@@ -412,48 +428,119 @@ class Mqtt:
             pass
         self.sock = None
 
+_mqtt, _tcp = Mqtt(), {"sock": None, "key": None}
+
+def deliver(sink, payload):
+    """Send one JSON payload (str) to a sink. Raises on failure."""
+    with deliver_lock:
+        c = cfg[sink]
+        try:
+            if sink == "http":
+                req = urllib.request.Request(c["url"], data=payload.encode(), method="POST",
+                                             headers={"Content-Type": "application/json"})
+                if c.get("auth_header"):
+                    k, _, v = c["auth_header"].partition(":")
+                    req.add_header(k.strip(), v.strip())
+                urllib.request.urlopen(req, timeout=8).read()
+            elif sink == "tcp":
+                key = (c["host"], c["port"])
+                if _tcp["sock"] is None or _tcp["key"] != key:
+                    if _tcp["sock"]:
+                        _tcp["sock"].close()
+                    _tcp["sock"], _tcp["key"] = socket.create_connection((c["host"], int(c["port"])), timeout=8), key
+                _tcp["sock"].sendall(payload.encode() + b"\n")
+            else:
+                _mqtt.publish(c, c["topic"], payload.encode())
+        except Exception:
+            if sink == "tcp" and _tcp["sock"]:
+                try: _tcp["sock"].close()
+                except OSError: pass
+                _tcp["sock"] = None
+            if sink == "mqtt":
+                _mqtt.close()
+            raise
+
+def make_payload(ev):
+    return json.dumps({"epc": ev["epc"], "rssi": ev["rssi"], "antenna": ev["ant"], "reader": ev["src"],
+                       "time": datetime.fromtimestamp(ev["t"]).isoformat(timespec="milliseconds")})
+
+def spool_append(sink, payload):
+    try:
+        if os.path.exists(SPOOL_PATH) and os.path.getsize(SPOOL_PATH) > 100 * 1024 * 1024:
+            return                                   # cap the spool at 100 MB
+        with open(SPOOL_PATH, "a") as f:
+            f.write(json.dumps({"sink": sink, "payload": payload}) + "\n")
+    except OSError as e:
+        log(f"Cannot write forward spool: {e}", "error")
+
 def forward_loop():
-    mqtt, tcp = Mqtt(), {"sock": None, "key": None}
     while True:
         sink, ev = fwd_q.get()
         stats["fwd_queued"] = fwd_q.qsize()
-        payload = json.dumps({"epc": ev["epc"], "rssi": ev["rssi"], "antenna": ev["ant"],
-                              "reader": ev["src"],
-                              "time": datetime.fromtimestamp(ev["t"]).isoformat(timespec="milliseconds")})
-        ok = False
-        for attempt in range(3):
+        payload = make_payload(ev)
+        err = ""
+        for _ in range(2):
             try:
-                c = cfg[sink]
-                if sink == "http":
-                    req = urllib.request.Request(c["url"], data=payload.encode(), method="POST",
-                                                 headers={"Content-Type": "application/json"})
-                    if c.get("auth_header"):
-                        k, _, v = c["auth_header"].partition(":")
-                        req.add_header(k.strip(), v.strip())
-                    urllib.request.urlopen(req, timeout=8).read()
-                elif sink == "tcp":
-                    key = (c["host"], c["port"])
-                    if tcp["sock"] is None or tcp["key"] != key:
-                        if tcp["sock"]: tcp["sock"].close()
-                        tcp["sock"], tcp["key"] = socket.create_connection((c["host"], int(c["port"])), timeout=8), key
-                    tcp["sock"].sendall(payload.encode() + b"\n")
-                else:
-                    mqtt.publish(c, c["topic"], payload.encode())
-                ok = True
+                deliver(sink, payload)
+                stats["fwd_ok"] += 1
                 break
             except Exception as e:
-                if sink == "tcp" and tcp["sock"]:
-                    try: tcp["sock"].close()
-                    except OSError: pass
-                    tcp["sock"] = None
-                mqtt.close() if sink == "mqtt" else None
                 err = str(e)
-                time.sleep(1.5)
-        if ok:
-            stats["fwd_ok"] += 1
+                time.sleep(1)
         else:
             stats["fwd_fail"] += 1
-            log(f"Forward to {sink} failed: {err}", "error")
+            spool_append(sink, payload)              # keep it; resent when the link is back
+            log(f"Forward to {sink} failed ({err}); saved to spool for retry", "error")
+
+def spool_loop():
+    """Resend spooled items (oldest first) every 30 s; stop at the first failure."""
+    while True:
+        time.sleep(30)
+        if not os.path.exists(SPOOL_PATH) or fwd_q.qsize() > 100:
+            continue
+        try:
+            with open(SPOOL_PATH) as f:
+                items = [json.loads(l) for l in f if l.strip()]
+        except (OSError, ValueError):
+            continue
+        sent = 0
+        for it in items:
+            if not cfg.get(it["sink"], {}).get("enabled"):
+                break
+            try:
+                deliver(it["sink"], it["payload"])
+                sent += 1
+                stats["fwd_ok"] += 1
+            except Exception:
+                break
+        if sent:
+            rest = items[sent:]
+            if rest:
+                with open(SPOOL_PATH + ".tmp", "w") as f:
+                    for it in rest:
+                        f.write(json.dumps(it) + "\n")
+                os.replace(SPOOL_PATH + ".tmp", SPOOL_PATH)
+            else:
+                os.remove(SPOOL_PATH)
+            log(f"Resent {sent} spooled item(s); {len(rest)} left")
+
+def spool_count():
+    try:
+        with open(SPOOL_PATH) as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+def monitor_loop():
+    """Every 15 s check whether the reader's command port answers."""
+    while True:
+        try:
+            reader_cmd(0xE0, timeout=3)
+            reader_status.update(reachable=True, error="")
+        except Exception as e:
+            reader_status.update(reachable=False, error=str(e))
+        reader_status["checked"] = time.time()
+        time.sleep(15)
 
 
 # ------------------------------------------------------------------ web UI
@@ -465,7 +552,9 @@ def state_json():
     now = time.time()
     return {"app": APP_NAME, "config": cfg, "stats": s, "tags": rows[:1000], "recent": recent[-100:],
             "links": {ip: round(now - t, 1) for ip, t in reader_links.items()},
-            "interfaces": INTERFACES, "workmodes": WORKMODES}
+            "interfaces": INTERFACES, "workmodes": WORKMODES,
+            "reader": dict(reader_status), "spool": spool_count(),
+            "last_tag_age": round(now - last_tag_time[0], 1) if last_tag_time[0] else None}
 
 def list_backups():
     try:
@@ -568,12 +657,38 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+    def _auth_ok(self):
+        if not PASSWORD[0]:
+            return True
+        import base64, hmac
+        h = self.headers.get("Authorization", "")
+        if h.startswith("Basic "):
+            try:
+                user, _, pw = base64.b64decode(h[6:]).decode().partition(":")
+                if hmac.compare_digest(pw, PASSWORD[0]):
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="' + APP_NAME + '"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
     def _origin_ok(self):
         o = self.headers.get("Origin")
         return o is None or o.split("//")[-1] == self.headers.get("Host")
     def do_GET(self):
         p = self.path.split("?")[0]
-        if p == "/":
+        if not self._auth_ok():
+            return
+        if p == "/api/health":
+            now = time.time()
+            live = [ip for ip, t in reader_links.items() if now - t < 130]
+            body = {"ok": bool(live), "reader_pushing": live, "reader_reachable": reader_status["reachable"],
+                    "last_tag_age_s": round(now - last_tag_time[0], 1) if last_tag_time[0] else None,
+                    "spool": spool_count(), "uptime_s": int(now - stats["started"])}
+            self._send(200 if body["ok"] else 503, body)
+        elif p == "/":
             self._send(200, PAGE.replace("__APP__", APP_NAME), "text/html; charset=utf-8")
         elif p == "/api/state":
             self._send(200, state_json())
@@ -610,6 +725,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not found"})
     def do_POST(self):
+        if not self._auth_ok():
+            return
         if not self._origin_ok() or self.headers.get("X-Requested-With") != "selfmade":
             return self._send(403, {"error": "forbidden"})
         n = int(self.headers.get("Content-Length") or 0)
@@ -630,7 +747,7 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
 header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line);flex-wrap:wrap}
 h1{font-size:18px;margin:0;font-weight:700}.pill{padding:3px 10px;border-radius:99px;font-size:12px;background:var(--acc2);color:var(--acc)}
-.pill.ok{background:rgba(24,121,78,.15);color:var(--ok)}.pill.bad{background:rgba(192,54,44,.15);color:var(--bad)}
+.pill.ok{background:rgba(24,121,78,.15);color:var(--ok)}.pill.bad{background:rgba(192,54,44,.15);color:var(--bad)}.pill.warn{background:rgba(161,92,7,.18);color:var(--warn)}
 nav{display:flex;gap:4px;padding:0 20px;background:var(--card);border-bottom:1px solid var(--line);overflow:auto}
 nav button{border:0;background:none;color:var(--mut);padding:11px 14px;font:inherit;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
 nav button.on{color:var(--acc);border-color:var(--acc);font-weight:600}
@@ -667,7 +784,8 @@ tr.new{background:var(--acc2)}.stats{display:grid;grid-template-columns:repeat(a
 <section id="s-setup"><div class="card"><h2>Quick setup: send tags over Ethernet</h2>
  <p class="sub">Sets the reader's Interface to RJ45 and points its remote server at this computer, then restarts it.</p>
  <div class="grid"><div><label>Reader IP</label><input id="c-ip"></div><div><label>Reader command port</label><input id="c-rport" type="number"></div>
- <div><label>Listen port on this computer</label><input id="c-lport" type="number"></div></div>
+ <div><label>Listen port on this computer</label><input id="c-lport" type="number"></div>
+ <div><label>Only accept readers from these IPs (optional, comma separated)</label><input id="c-allow" placeholder="empty = any reader"></div></div>
  <div class="row"><button class="b" onclick="saveConn()">Save</button><button class="b" onclick="discover()">Find readers on the network</button>
  <button class="b p" onclick="oneClick()">One-click Ethernet setup</button></div><div id="found" class="sub" style="margin-top:10px"></div></div>
 
@@ -698,7 +816,8 @@ tr.new{background:var(--acc2)}.stats{display:grid;grid-template-columns:repeat(a
 <section id="s-data"><div class="card"><h2>Storage</h2><p class="sub">Every tag read is appended to a CSV file.</p>
  <div class="grid"><div><label>CSV file path</label><input id="d-csv"></div>
  <div><label>Save</label><select id="d-ded"><option value="0">every read</option><option value="1">one row per tag per 1 s</option><option value="5">per 5 s</option><option value="60">per minute</option></select></div>
- <div><label>CSV enabled</label><select id="d-csve"><option value="true">yes</option><option value="false">no</option></select></div></div></div>
+ <div><label>CSV enabled</label><select id="d-csve"><option value="true">yes</option><option value="false">no</option></select></div>
+ <div><label>New file every day</label><select id="d-daily"><option value="false">no (one file)</option><option value="true">yes (name_YYYY-MM-DD.csv)</option></select></div></div></div>
  <div class="card"><h2>Forward over the internet</h2><p class="sub">Uses whatever connection this computer has: Ethernet, WiFi, or a 4G/5G hotspot.</p>
  <div class="note">HTTP and MQTT payload: {"epc","rssi","antenna","reader","time"}.</div>
  <h2 style="margin-top:6px">HTTP / webhook</h2><div class="grid"><div><label>Enabled</label><select id="h-en"><option value="false">no</option><option value="true">yes</option></select></div>
@@ -727,23 +846,27 @@ async function api(p,b){const r=await fetch(p,{method:"POST",headers:{"X-Request
  const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j}
 async function act(p,b,ok){try{const j=await api(p,b);if(ok)toast(ok);return j}catch(e){toast(e.message,1);throw e}}
 function fill(sel,map,v){sel.innerHTML=Object.entries(map).map(([k,n])=>`<option value="${k}">${k} - ${n}</option>`).join("");if(v!=null)sel.value=v}
-function loadCfg(c){$("c-ip").value=c.reader_ip;$("c-rport").value=c.reader_port;$("c-lport").value=c.listen_port;
+function loadCfg(c){$("c-ip").value=c.reader_ip;$("c-rport").value=c.reader_port;$("c-lport").value=c.listen_port;$("c-allow").value=(c.allowed_reader_ips||[]).join(", ");$("d-daily").value=String(!!c.csv_daily);
  $("d-csv").value=c.csv_path;$("d-ded").value=String(c.dedup_seconds);$("d-csve").value=String(c.csv_enabled);
  $("h-en").value=String(c.http.enabled);$("h-url").value=c.http.url;$("h-auth").value=c.http.auth_header;
  $("m-en").value=String(c.mqtt.enabled);$("m-host").value=c.mqtt.host;$("m-port").value=c.mqtt.port;$("m-topic").value=c.mqtt.topic;$("m-user").value=c.mqtt.user;$("m-pass").value=c.mqtt.password;$("m-cid").value=c.mqtt.client_id;
  $("t-en").value=String(c.tcp.enabled);$("t-host").value=c.tcp.host;$("t-port").value=c.tcp.port}
 async function refresh(){const s=await (await fetch("/api/state")).json();S=s;
  if(!loaded){loaded=true;fill($("p-if"),s.interfaces);fill($("p-wm"),s.workmodes);loadCfg(s.config);loadBackups();readReader(true)}
- $("st-reads").textContent=s.stats.reads;$("st-uniq").textContent=s.tags.length;$("st-csv").textContent=s.stats.csv_rows;$("st-fwd").textContent=s.stats.fwd_ok+" / "+s.stats.fwd_fail;
+ $("st-reads").textContent=s.stats.reads;$("st-uniq").textContent=s.tags.length;$("st-csv").textContent=s.stats.csv_rows;$("st-fwd").textContent=s.stats.fwd_ok+" / "+s.stats.fwd_fail+(s.spool?" (waiting: "+s.spool+")":"");
  const links=Object.entries(s.links).filter(([ip,a])=>a<130);const l=$("link");
- l.className="pill "+(links.length?"ok":"bad");l.textContent=links.length?"reader connected: "+links.map(x=>x[0]).join(", "):"no reader connected";
+ let txt,cls;if(links.length){cls="ok";txt="reader connected: "+links.map(x=>x[0]).join(", ")}
+ else if(s.reader&&s.reader.reachable===false){cls="bad";txt="reader not reachable - check cable, power and IP"}
+ else if(s.reader&&s.reader.reachable===true){cls="warn";txt="reader reachable but not sending - run One-click Ethernet setup"}
+ else{cls="";txt="checking reader..."}
+ l.className="pill "+cls;l.textContent=txt;
  $("up").textContent="up "+Math.floor(s.stats.uptime/60)+" min";renderTags(s.tags)}
 function renderTags(rows){$("tags").innerHTML=rows.map(r=>`<tr><td class="m">${r.epc}</td><td>${r.count}</td><td>${r.rssi}</td><td>${r.ant}</td><td>${new Date(r.last*1000).toLocaleTimeString()}</td></tr>`).join("")||`<tr><td colspan=5 class="sub">No tags yet. Hold a tag near the reader.</td></tr>`}
 function logLine(t){const l=$("log");l.textContent+=t+"\n";if(l.textContent.length>60000)l.textContent=l.textContent.slice(-30000);l.scrollTop=l.scrollHeight}
 const es=new EventSource("/events");es.onmessage=e=>{const d=JSON.parse(e.data);
  if(d.type=="log")logLine(d.text);else if(d.type=="tag"){clearTimeout(window._r);window._r=setTimeout(refresh,250)}
  else if(d.type=="link"||d.type=="clear")refresh()};
-async function saveConn(){await act("/api/config",{reader_ip:$("c-ip").value.trim(),reader_port:+$("c-rport").value,listen_port:+$("c-lport").value},"Saved")}
+async function saveConn(){await act("/api/config",{reader_ip:$("c-ip").value.trim(),reader_port:+$("c-rport").value,listen_port:+$("c-lport").value,allowed_reader_ips:$("c-allow").value.split(",").map(x=>x.trim()).filter(Boolean)},"Saved")}
 async function discover(){$("found").textContent="Listening for reader broadcasts (7 s)...";try{const r=await act("/api/discover",{});
  $("found").innerHTML=r.readers.length?r.readers.map(x=>`Found reader <b>${x.ip}</b> (MAC ${x.mac}) <a href="#" onclick="$('c-ip').value='${x.ip}';saveConn();return false">use it</a>`).join("<br>"):"No reader found. Check cable and that this computer is on 192.168.1.x."}catch(e){$("found").textContent=""}}
 async function readReader(quiet){try{const r=await api("/api/reader/read");const p=r.params,n=r.network;
@@ -761,7 +884,7 @@ async function oneClick(){if(!confirm("Set the reader to Ethernet (RJ45) and pus
 async function loadBackups(){const b=await (await fetch("/api/backups")).json();$("bk").innerHTML=b.map(x=>`<option>${x}</option>`).join("")||"<option value=''>(none yet)</option>"}
 async function backupNow(){await act("/api/reader/backup",{},"Backup saved");loadBackups()}
 async function restore(){const f=$("bk").value;if(!f||!confirm("Restore "+f+" to the reader?"))return;await act("/api/reader/restore",{file:f},"Restored. Restart the reader to apply.");loadBackups()}
-async function saveData(){await act("/api/config",{csv_path:$("d-csv").value,dedup_seconds:+$("d-ded").value,csv_enabled:$("d-csve").value=="true",
+async function saveData(){await act("/api/config",{csv_path:$("d-csv").value,dedup_seconds:+$("d-ded").value,csv_enabled:$("d-csve").value=="true",csv_daily:$("d-daily").value=="true",
  http:{enabled:$("h-en").value=="true",url:$("h-url").value,auth_header:$("h-auth").value},
  mqtt:{enabled:$("m-en").value=="true",host:$("m-host").value,port:+$("m-port").value,topic:$("m-topic").value,user:$("m-user").value,password:$("m-pass").value,client_id:$("m-cid").value},
  tcp:{enabled:$("t-en").value=="true",host:$("t-host").value,port:+$("t-port").value}},"Saved")}
@@ -779,9 +902,10 @@ def _run(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode, (r.stdout + r.stderr).strip()
 
-def autostart(install):
+def autostart(install, extra=()):
     """Install/remove start-at-login for this user (Linux systemd, macOS launchd, Windows Task Scheduler)."""
     script, exe = os.path.abspath(__file__), sys.executable
+    extra_s = "".join(" " + a for a in extra)
     if sys.platform.startswith("linux"):
         d = os.path.expanduser("~/.config/systemd/user")
         unit = os.path.join(d, SERVICE_NAME + ".service")
@@ -789,7 +913,7 @@ def autostart(install):
             os.makedirs(d, exist_ok=True)
             with open(unit, "w") as f:
                 f.write(f"[Unit]\nDescription={APP_NAME}\nAfter=network-online.target\n\n[Service]\n"
-                        f"ExecStart={exe} {script} --no-browser\nWorkingDirectory={HERE}\n"
+                        f"ExecStart={exe} {script} --no-browser{extra_s}\nWorkingDirectory={HERE}\n"
                         f"Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n")
             _run(["systemctl", "--user", "daemon-reload"])
             rc, out = _run(["systemctl", "--user", "enable", "--now", SERVICE_NAME + ".service"])
@@ -809,7 +933,7 @@ def autostart(install):
                 f.write(f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>Label</key><string>com.selfmade.{SERVICE_NAME}</string>
-<key>ProgramArguments</key><array><string>{exe}</string><string>{script}</string><string>--no-browser</string></array>
+<key>ProgramArguments</key><array><string>{exe}</string><string>{script}</string><string>--no-browser</string>{"".join("<string>%s</string>" % a for a in extra)}</array>
 <key>WorkingDirectory</key><string>{HERE}</string><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 <key>StandardOutPath</key><string>{HERE}/selfmade_reader.log</string><key>StandardErrorPath</key><string>{HERE}/selfmade_reader.log</string>
 </dict></plist>''')
@@ -822,7 +946,7 @@ def autostart(install):
         pyw = exe[:-10] + "pythonw.exe" if exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe") else exe
         if install:
             rc, out = _run(["schtasks", "/Create", "/TN", "SelfmadeReader", "/SC", "ONLOGON", "/F",
-                            "/TR", f'"{pyw}" "{script}" --no-browser'])
+                            "/TR", f'"{pyw}" "{script}" --no-browser{extra_s}'])
             print(out)
             if rc == 0: _run(["schtasks", "/Run", "/TN", "SelfmadeReader"])
         else:
@@ -838,14 +962,24 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="address for the web UI (default: this computer only)")
     ap.add_argument("--port", type=int, default=8088, help="web UI port")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--password", default=os.environ.get("SELFMADE_PASSWORD", ""),
+                    help="protect the web page with this password (user name: any). Also env SELFMADE_PASSWORD")
     ap.add_argument("--install-autostart", action="store_true", help="start automatically at login/boot, then exit")
     ap.add_argument("--uninstall-autostart", action="store_true", help="remove the automatic start, then exit")
     args = ap.parse_args()
     if args.install_autostart or args.uninstall_autostart:
-        return autostart(args.install_autostart)
+        extra = []
+        if args.host != "127.0.0.1": extra += ["--host", args.host]
+        if args.port != 8088: extra += ["--port", str(args.port)]
+        if args.password: print("Note: --password is not stored in the service; set SELFMADE_PASSWORD in the service environment instead.")
+        return autostart(args.install_autostart, extra)
     load_config()
-    threading.Thread(target=listener_loop, daemon=True).start()
-    threading.Thread(target=forward_loop, daemon=True).start()
+    PASSWORD[0] = args.password
+    if args.host not in ("127.0.0.1", "localhost") and not args.password:
+        print("WARNING: the web page is reachable from the network without a password. "
+              "Anyone who can open it can change the reader's settings. Use --password.", flush=True)
+    for fn in (listener_loop, forward_loop, spool_loop, monitor_loop):
+        threading.Thread(target=fn, daemon=True).start()
     try:
         srv = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as e:
