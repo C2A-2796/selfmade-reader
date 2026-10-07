@@ -1,0 +1,11 @@
+# runtime data and per-machine settings - never commit
+selfmade_reads.csv
+*.csv
+selfmade_reader_config.json
+selfmade_reader.log
+backup/
+__pycache__/
+*.pcap
+# vendor software is not redistributed here
+ReaderSoft*/
+*.rar
