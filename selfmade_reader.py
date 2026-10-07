@@ -743,7 +743,7 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>__APP__</title>
 <style>
 :root{--bg:#f4f6f8;--card:#fff;--ink:#17202a;--mut:#667085;--line:#e1e6ec;--acc:#0b6bcb;--acc2:#e8f1fb;--ok:#18794e;--bad:#c0362c;--warn:#a15c07}
-@media(prefers-color-scheme:dark){:root{--bg:#0f1419;--card:#18202a;--ink:#e6ebf1;--mut:#93a1b1;--line:#263140;--acc:#4da3ff;--acc2:#16283d;--ok:#4cc38a;--bad:#ff7b72;--warn:#e3b341}}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0f1419;--card:#18202a;--ink:#e6ebf1;--mut:#93a1b1;--line:#263140;--acc:#4da3ff;--acc2:#16283d;--ok:#4cc38a;--bad:#ff7b72;--warn:#e3b341}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
 header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line);flex-wrap:wrap}
 h1{font-size:18px;margin:0;font-weight:700}.pill{padding:3px 10px;border-radius:99px;font-size:12px;background:var(--acc2);color:var(--acc)}
@@ -768,6 +768,7 @@ tr.new{background:var(--acc2)}.stats{display:grid;grid-template-columns:repeat(a
 #log{font:12px ui-monospace,Consolas,monospace;height:340px;overflow:auto;background:#0d1117;color:#b9e6c9;padding:10px;border-radius:8px;white-space:pre-wrap}
 .warn{color:var(--warn);font-size:12px;margin-top:4px}.note{background:var(--acc2);padding:9px 12px;border-radius:8px;font-size:13px;margin-bottom:12px}
 #toast{position:fixed;right:18px;bottom:18px;padding:11px 16px;border-radius:8px;background:var(--ink);color:var(--bg);display:none;max-width:420px}
+:root[data-theme=dark]{--bg:#0f1419;--card:#18202a;--ink:#e6ebf1;--mut:#93a1b1;--line:#263140;--acc:#4da3ff;--acc2:#16283d;--ok:#4cc38a;--bad:#ff7b72;--warn:#e3b341}
 </style></head><body>
 <header><h1>__APP__</h1><span id="link" class="pill bad">no reader connected</span><span id="up" class="pill"></span></header>
 <nav id="nav"></nav>
@@ -840,7 +841,8 @@ $("nav").innerHTML=tabs.map(t=>`<button data-t="${t[0]}">${t[1]}</button>`).join
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>show(b.dataset.t));
 function show(t){document.querySelectorAll("section").forEach(s=>s.classList.toggle("on",s.id=="s-"+t));
  document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.t==t));localStorage.tab=t}
-show(localStorage.tab||"dash");
+if(/[?&]theme=(light|dark)/.test(location.search))document.documentElement.dataset.theme=RegExp.$1;
+show((location.hash||"").slice(1)||localStorage.tab||"dash");
 function toast(m,bad){const t=$("toast");t.textContent=m;t.style.background=bad?"#c0362c":"";t.style.color=bad?"#fff":"";t.style.display="block";clearTimeout(t._x);t._x=setTimeout(()=>t.style.display="none",4500)}
 async function api(p,b){const r=await fetch(p,{method:"POST",headers:{"X-Requested-With":"selfmade","Content-Type":"application/json"},body:JSON.stringify(b||{})});
  const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j}
